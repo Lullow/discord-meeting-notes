@@ -280,15 +280,41 @@ def render_transcript(events) -> str:
     )
 
 
-def summarize(transcript: str, model: str = "claude-sonnet-5") -> str:
+def load_gaps(session_dir: Path) -> list[dict]:
+    """Perioder då boten inte tog emot ljud från någon, enligt session.json.
+
+    Tomt för inspelningar från andra källor, t.ex. Craig, som saknar filen.
+    """
+    path = session_dir / "session.json"
+    if not path.exists():
+        return []
+    return json.loads(path.read_text(encoding="utf-8")).get("gaps", [])
+
+
+def format_gaps(gaps) -> str:
+    return ", ".join(f"{format_ts(g['start_s'])}–{format_ts(g['end_s'])}" for g in gaps)
+
+
+def summarize(transcript: str, gaps=(), model: str = "claude-sonnet-5") -> str:
     import anthropic
+
+    content = transcript
+    if gaps:
+        # Utan detta skriver modellen en sammanfattning som ser komplett ut,
+        # och en lucka på en timme läses som att inget mer sades.
+        content = (
+            f"OBS: inspelningen saknar ljud under {format_gaps(gaps)} "
+            "(mottagningen föll bort, mötet fortsatte). Säg i sammanfattningen "
+            "att den bara täcker resten, och påstå inte att något inte togs upp.\n\n"
+            + transcript
+        )
 
     client = anthropic.Anthropic()  # läser ANTHROPIC_API_KEY från env
     resp = client.messages.create(
         model=model,
         max_tokens=4000,
         system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": transcript}],
+        messages=[{"role": "user", "content": content}],
     )
     return "".join(block.text for block in resp.content if block.type == "text")
 
@@ -327,7 +353,15 @@ def main():
         return
 
     print("Sammanfattar...")
-    (session_dir / "summary.md").write_text(summarize(transcript), encoding="utf-8")
+    gaps = load_gaps(session_dir)
+    summary = summarize(transcript, gaps)
+    if gaps:
+        # Överst, så att den syns i Discord innan någon läser vidare.
+        summary = (
+            f"> ⚠️ Inspelningen saknar ljud {format_gaps(gaps)}. "
+            "Sammanfattningen täcker bara resten av mötet.\n\n" + summary
+        )
+    (session_dir / "summary.md").write_text(summary, encoding="utf-8")
     print(f"Skrev {session_dir / 'summary.md'}")
 
 
