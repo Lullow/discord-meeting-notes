@@ -137,11 +137,14 @@ _harden_packet_router()
 _patch_udp_keepalive()
 
 
-# Discord skickar 20 ms Opus-ramar. Används för att skilja normal
-# pakettakt från en verklig paus i talet.
+# Discord skickar 20 ms Opus-ramar.
 FRAME_S = 0.02
 SAMPLE_RATE = 48000
 BYTES_PER_FRAME = 2 * 2  # 16-bit, stereo
+BYTES_PER_S = SAMPLE_RATE * BYTES_PER_FRAME
+# Så långt efter väggklockan får ett spår ligga innan tystnad fylls i. Tre
+# ramar, så att vanlig nätverksjitter inte ger små hack mitt i en mening.
+LAG_TOLERANCE_S = 0.06
 
 
 class TimestampedWaveSink(discord.sinks.WaveSink):
@@ -152,42 +155,57 @@ class TimestampedWaveSink(discord.sinks.WaveSink):
     talarens egna paket hopklippta kant i kant. Alla spår börjar därmed på sin
     egen nolla, och ordningen mellan personer blir meningslös.
 
-    Vi mäter ankomsttiden för varje paket och skjuter in motsvarande tystnad i
-    luckorna. Det räcker inte att padda i början: den som talar på minut 2 och
-    igen på minut 10 får annars blocken kant i kant och hamnar fel ändå.
+    Varje spår fylls ut mot absolut position: när ett paket kommer ska spåret
+    ligga där väggklockan står. Ligger spåret efter fylls tystnad i. Ligger det
+    före, efter en burst av försenade paket, väntar vi bara in klockan och
+    kastar inget ljud. Felet begränsas då till en paketburst och växer inte.
+    Att istället padda med tiden sedan förra paketet räknar varje jitter och
+    trådstopp som tystnad utan att dra av bursten efteråt. Så drev spåren upp
+    till fem minuter under ett 85-minutersmöte.
 
     Noggrannheten begränsas av att vi mäter när paketet *behandlades*, inte när
-    ordet sades - nätverksjitter och buffring ger någon tiondels sekund. Det är
-    oändligt mycket bättre än att allt ligger på noll.
+    ordet sades - nätverksjitter och buffring ger någon tiondels sekund.
 
     Räknarna används för att se var ljud försvinner: mottaget tal jämfört med
     väggklockan visar hur stor andel som faktiskt kom fram.
     """
 
-    def __init__(self, *, filters=None):
+    def __init__(self, *, t0: float, filters=None):
         super().__init__(filters=filters)
-        self.t0 = time.monotonic()
-        self.last_write: dict = {}
+        self.t0 = t0
+        self.stopped_at: float | None = None
         self.stats: dict = {}
 
-    def write(self, data, user):
-        now = time.monotonic()
-        st = self.stats.setdefault(
-            user, {"packets": 0, "first_s": round(now - self.t0, 2), "silence_s": 0.0}
+    def _stats(self, user, elapsed: float) -> dict:
+        return self.stats.setdefault(
+            user, {"packets": 0, "first_s": round(elapsed, 2), "silence_s": 0.0}
         )
 
-        last = self.last_write.get(user)
-        gap = (now - self.t0) if last is None else (now - last - FRAME_S)
+    def _pad_to(self, user, elapsed: float, tolerance_s: float) -> None:
+        audio = self.audio_data.get(user)
+        pos = audio.file.tell() if audio is not None else 0
+        target = int(elapsed * SAMPLE_RATE) * BYTES_PER_FRAME
+        if target - pos > tolerance_s * BYTES_PER_S:
+            super().write(b"\x00" * (target - pos), user)
+            self._stats(user, elapsed)["silence_s"] += (target - pos) / BYTES_PER_S
 
-        # Tak mot att en klockspik skriver en absurd mängd nollor.
-        if 0.05 < gap <= (now - self.t0) + 1:
-            n = int(gap * SAMPLE_RATE) * BYTES_PER_FRAME
-            super().write(b"\x00" * n, user)
-            st["silence_s"] += round(gap, 2)
-
+    def write(self, data, user):
+        elapsed = time.monotonic() - self.t0
+        st = self._stats(user, elapsed)
+        # Paketet bär de senaste 20 ms, så ljudet började en ram före nu.
+        self._pad_to(user, elapsed - FRAME_S, LAG_TOLERANCE_S)
         st["packets"] += 1
-        self.last_write[user] = now
         super().write(data, user)
+
+    def cleanup(self):
+        # Alla spår fylls ut till samma slut. Ett spår som slutar tidigt kan
+        # annars misstolkas som att personen gick. Körs efter att router-tråden
+        # stoppats och innan WaveSink skriver WAV-headern.
+        self.stopped_at = time.monotonic()
+        elapsed = self.stopped_at - self.t0
+        for user in list(self.audio_data):
+            self._pad_to(user, elapsed, 0.0)
+        super().cleanup()
 
 
 active = {}  # guild_id -> sessionsinfo
@@ -321,7 +339,10 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
             }
         )
 
-    wall_clock_s = round(time.monotonic() - session["t0"], 2)
+    # Sinken fyllde ut spåren till stopped_at, så väggklockan mäts dit och inte
+    # till nu - on_recording_done körs en stund efter att inspelningen stoppats.
+    stopped_at = getattr(sink, "stopped_at", None) or time.monotonic()
+    wall_clock_s = round(stopped_at - session["t0"], 2)
     (session_dir / "session.json").write_text(
         json.dumps(
             {
@@ -336,9 +357,9 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
         encoding="utf-8",
     )
 
-    # Spåren fylls nu ut med tystnad i luckorna, så ett spår slutar när talaren
-    # sist hördes - aldrig efter väggklockan. Gör det ändå har tidsmätningen
-    # spårat ur, och tidslinjen går inte att lita på.
+    # Sinken fyller ut alla spår till exakt väggklockan, och ett spår kan bara
+    # ligga före med en paketburst. Är ett spår ändå tydligt längre har
+    # tidsmätningen spårat ur, och tidslinjen går inte att lita på.
     overrun = [
         t["display_name"] for t in tracks if t["duration_s"] > wall_clock_s * 1.1 + 1
     ]
@@ -434,7 +455,8 @@ async def record(ctx: discord.ApplicationContext):
 
     try:
         vc.start_recording(
-            TimestampedWaveSink(),
+            # Samma nolla som väggklockan i session.json.
+            TimestampedWaveSink(t0=active[ctx.guild.id]["t0"]),
             on_recording_done,
             ctx.guild.id,
             # sync_start används inte: den är deprekerad sedan 2.7 och en
