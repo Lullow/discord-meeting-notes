@@ -28,6 +28,20 @@ RECORDINGS_DIR = Path(os.getenv("RECORDINGS_DIR", "recordings"))
 PIPELINE = Path(__file__).parent / "pipeline.py"
 PIPELINE_TIMEOUT_S = 60 * 60
 
+# Loggfil med tidsstämplar. print() buffras när utdata omdirigeras till fil, så
+# ordningen där går inte att lita på, och py-cords egna INFO- och ERROR-loggar
+# (voice-reconnects, DAVE-övergångar) syns inte alls utan en handler.
+_log_handler = logging.FileHandler("bot.log", encoding="utf-8")
+_log_handler.setLevel(logging.INFO)
+_log_handler.setFormatter(
+    logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+)
+logging.basicConfig(level=logging.WARNING, handlers=[_log_handler])
+for _name in ("discord.voice", "sound-bot"):
+    logging.getLogger(_name).setLevel(logging.INFO)
+
+_log = logging.getLogger("sound-bot")
+
 # VOICE_DEBUG=1 loggar py-cords röstmottagning till voice-debug.log.
 # DAVE-dekrypteringsfel syns bara på DEBUG-nivå. Loggen blir stor - varje
 # paket ger en rad, alltså ~50 rader per sekund och talare. Bara för felsökning.
@@ -94,8 +108,33 @@ def _harden_packet_router() -> None:
     PacketRouter._sound_bot_hardened = True
 
 
-_log = logging.getLogger(__name__)
+def _patch_udp_keepalive() -> None:
+    """Får UDP-keepalive att skickas var 5:e sekund istället för var 83:e minut.
+
+    `UDPKeepAlive.delay` är 5000 och används som `time.sleep(self.delay)`,
+    alltså i sekunder. En keepalive går iväg när inspelningen startar och nästa
+    först efter 83:20. Discord slutar skicka ljud till en klient som inte hörts
+    av på några minuter, så mottagningen dör tyst efter 5-9 minuter och kommer
+    tillbaka vid 83:20. Samma kod på master och på fix/voice-rec-2.
+
+    Villkorat: fixar upstream felet genom att byta enhet, t.ex.
+    `sleep(delay / 1000)`, får vi inte sätta 5 ms. Loggen säger när lappen kan
+    tas bort.
+    """
+    from discord.voice.receive.reader import UDPKeepAlive
+
+    if UDPKeepAlive.delay > 60:
+        _log.info("Lappar UDPKeepAlive.delay: %s -> 5 s", UDPKeepAlive.delay)
+        UDPKeepAlive.delay = 5
+    else:
+        _log.info(
+            "UDPKeepAlive.delay är %s, keepalive-lappen behövs inte längre",
+            UDPKeepAlive.delay,
+        )
+
+
 _harden_packet_router()
+_patch_udp_keepalive()
 
 
 # Discord skickar 20 ms Opus-ramar. Används för att skilja normal
