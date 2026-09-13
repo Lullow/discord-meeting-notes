@@ -1,0 +1,12 @@
+# Röstmottagning är trasig i alla släppta py-cord-versioner (2.8.1 och äldre):
+#   - 2.8.1 släppte den nya receive-routern utan de matchande ändringarna i
+#     Sink-basklassen, så start_recording() kastar
+#     AttributeError: 'WaveSink' object has no attribute '__sink_listeners__'
+#   - äldre versioner saknar stöd för Discords DAVE-kryptering (E2EE) helt
+# PR #3159 (branch fix/voice-rec-2) fixar båda. Byt tillbaka till en vanlig
+# version så snart den är merged och släppt.
+#   Följ: https://github.com/Pycord-Development/pycord/issues/3139
+py-cord[voice] @ git+https://github.com/Pycord-Development/pycord.git@fix/voice-rec-2
+python-dotenv>=1.0
+faster-whisper>=1.1
+anthropic>=0.40
