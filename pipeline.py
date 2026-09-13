@@ -78,11 +78,6 @@ HOTWORDS = (
     "Elias, Emil, Bella, Sonia, Gabriella, Lullo"
 )
 
-INITIAL_PROMPT = (
-    "Ett standupmöte på svenska om ett RAG-projekt. Deltagarna pratar om "
-    "sökstrategier, BM25, hybridsökning, metadatafiltrering och Jira-tickets."
-)
-
 SYSTEM_PROMPT = """Du får en talarmärkt utskrift från en scrum-liknande standup
 på Discord med några få deltagare. Utskriften kommer från automatisk
 taligenkänning: den innehåller fel, avbrutna meningar, och eftersom folk pratar
@@ -122,8 +117,18 @@ mikrofonläckage – tillskriv den då till en person och markera "(osäker tala
 BACKCHANNELS = {
     "ja", "nej", "mm", "mhm", "aa", "okej", "ok", "precis", "japp", "jo",
     "just det", "absolut", "exakt", "yes", "yeah", "tack", "hej", "hallå",
-    "tack för att du tittade", "tack för att ni tittade", "undertexter av",
 }
+
+# Fraser Whisper hittar på ur tystnad och brus, inlärda från undertextade
+# videor. De står i korta segment, ofta med en påhittad följdmening ("Tack för
+# att ni har tittat på den här videon. Vi hörs om det är något."), så de fångas
+# bara upp till en viss längd. I en lång replik är frasen troligen riktigt tal.
+HALLUCINATIONS = (
+    "tack för att du tittade", "tack för att ni tittade",
+    "tack för att du har tittat", "tack för att ni har tittat",
+    "den här videon", "undertexter av", "prenumerera",
+)
+HALLUCINATION_MAX_WORDS = 20
 
 
 def format_ts(seconds: float) -> str:
@@ -139,9 +144,10 @@ def normalize(text: str) -> str:
 def is_junk(seg_text: str, duration: float, no_speech_prob: float, avg_logprob: float):
     """Returnerar en anledning om segmentet ska bort, annars None.
 
-    Tre oberoende signaler, för de fångar olika fel:
+    Fyra oberoende signaler, för de fångar olika fel:
       no_speech_prob – Whisper tror själv att det inte var tal
       avg_logprob    – låg konfidens, typiskt hallucination eller mumlande
+      hallucination  – känd påhittad fras, ofta med hög konfidens
       backchannel    – korrekt transkriberat men innehållslöst
     """
     norm = normalize(seg_text)
@@ -149,6 +155,10 @@ def is_junk(seg_text: str, duration: float, no_speech_prob: float, avg_logprob: 
         return "no_speech"
     if avg_logprob < -1.0:
         return "low_confidence"
+    if len(norm.split()) <= HALLUCINATION_MAX_WORDS and any(
+        phrase in norm for phrase in HALLUCINATIONS
+    ):
+        return "hallucination"
     if norm in BACKCHANNELS and duration < 2.0:
         return "backchannel"
     if len(norm) < 2:
@@ -229,11 +239,11 @@ def transcribe_session(session_dir: Path, model_size: str, language: str, device
             # Utan detta kan modellen fastna i upprepningsloopar.
             condition_on_previous_text=False,
             beam_size=5,
-            # hotwords biasar varje fönster. initial_prompt gör det bara för
-            # det första: med condition_on_previous_text=False nollställs
-            # prompten efter fönster ett, och ett spår är minutlångt.
+            # hotwords biasar varje fönster. Ingen initial_prompt: den gällde
+            # bara första fönstret, och när spåret börjar tyst skriver Whisper
+            # ut prompten själv som en replik ("Deltagarna pratar om
+            # sökstrategier...", tillskriven den som äger spåret).
             hotwords=HOTWORDS,
-            initial_prompt=INITIAL_PROMPT,
         )
         for seg in segments:
             text = seg.text.strip()
