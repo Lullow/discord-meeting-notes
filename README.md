@@ -66,14 +66,27 @@ python pipeline.py recordings\2026-08-31_19-04-12
 python pipeline.py recordings\2026-08-31_19-04-12 --device cpu --model medium
 ```
 
+### Tystnadsvakt
+
+Kommer inget ljud från någon på 3 minuter medan minst 2 personer sitter i
+röstkanalen skickar boten en extra UDP-keepalive. Hjälper inte det inom 30 s
+varnar den i textkanalen och säger till när ljudet är tillbaka. Luckorna sparas
+i `session.json` och visas överst i `summary.md`. Trösklarna ställs i `.env`
+med `SILENCE_WARN_MIN` och `SILENCE_WARN_MIN_HUMANS`.
+
+Loggar med tidsstämplar hamnar i `bot.log`.
+
 ## Kända begränsningar
 
-- **Spårsynk.** `sync_start=True` ser till att alla spår börjar på samma t=0,
-  men py-cord fyller inte alltid ut tystnad mitt i en inspelning. Boten skriver
-  därför varje spårs längd till `session.json` och varnar om ett spår avviker
-  mer än 10 % från väggklockan. Får du den varningen är den globala tidslinjen
-  opålitlig — talaretiketterna stämmer fortfarande, men ordningen mellan
-  personer kan vara fel.
+- **py-cord från en PR-branch.** Röstmottagning fungerar bara på
+  `fix/voice-rec-2` (se `requirements.txt`), och `bot.py` lappar två fel i den.
+  Ett trasigt Opus-paket dödar annars hela inspelningen. `UDPKeepAlive` skickar
+  keepalive var 83:e minut istället för var 5:e sekund, så Discord slutar skicka
+  ljud efter 5–9 minuter. Loggen säger när keepalive-lappen inte längre behövs.
+- **Spårsynk.** Varje spår fylls ut med tystnad mot väggklockan, så alla spår
+  delar tidslinje och är lika långa. Tiden mäts när paketet behandlas och inte
+  när ordet sades, så ordningen mellan talare kan vara fel med upp till längden
+  på ett trådstopp, typiskt under en sekund.
 - **6 h+ sessioner** bör chunkas innan sammanfattning. En 2-timmarsutskrift är
   runt 30k tokens och går fint i ett anrop.
 - Whisper hallucinerar på tyst ljud. `vad_filter=True` är därför inte valfritt.

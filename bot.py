@@ -146,6 +146,14 @@ BYTES_PER_S = SAMPLE_RATE * BYTES_PER_FRAME
 # ramar, så att vanlig nätverksjitter inte ger små hack mitt i en mening.
 LAG_TOLERANCE_S = 0.06
 
+# Tystnadsvakten: så länge utan ljud från någon, med minst så många människor
+# i kanalen, innan boten reagerar. Styrbart för att kunna testa varningen ensam.
+SILENCE_WARN_S = float(os.getenv("SILENCE_WARN_MIN", "3")) * 60
+SILENCE_WARN_MIN_HUMANS = int(os.getenv("SILENCE_WARN_MIN_HUMANS", "2"))
+# Så länge vakten väntar efter en extra keepalive innan den varnar.
+SILENCE_NUDGE_WAIT_S = 30
+WATCH_INTERVAL_S = 10
+
 
 class TimestampedWaveSink(discord.sinks.WaveSink):
     """WaveSink som återställer den gemensamma tidslinjen.
@@ -166,8 +174,8 @@ class TimestampedWaveSink(discord.sinks.WaveSink):
     Noggrannheten begränsas av att vi mäter när paketet *behandlades*, inte när
     ordet sades - nätverksjitter och buffring ger någon tiondels sekund.
 
-    Räknarna används för att se var ljud försvinner: mottaget tal jämfört med
-    väggklockan visar hur stor andel som faktiskt kom fram.
+    Räknarna används för att se var ljud försvinner: paket per minut visar när
+    mottagningen dog, och `silences` perioder då ingen alls hördes.
     """
 
     def __init__(self, *, t0: float, filters=None):
@@ -175,11 +183,25 @@ class TimestampedWaveSink(discord.sinks.WaveSink):
         self.t0 = t0
         self.stopped_at: float | None = None
         self.stats: dict = {}
+        # Skrivs i router-tråden och läses av tystnadsvakten i event-loopen.
+        # Tilldelning och append är atomära under GIL:en, så inget lås behövs.
+        self.last_heard: float = t0
+        self.silences: list[tuple[float, float]] = []
 
     def _stats(self, user, elapsed: float) -> dict:
         return self.stats.setdefault(
-            user, {"packets": 0, "first_s": round(elapsed, 2), "silence_s": 0.0}
+            user,
+            {
+                "packets": 0,
+                "first_s": round(elapsed, 2),
+                "silence_s": 0.0,
+                "packets_per_min": [],
+            },
         )
+
+    def _note_silence(self, now: float) -> None:
+        if now - self.last_heard >= SILENCE_WARN_S:
+            self.silences.append((self.last_heard - self.t0, now - self.t0))
 
     def _pad_to(self, user, elapsed: float, tolerance_s: float) -> None:
         audio = self.audio_data.get(user)
@@ -190,10 +212,18 @@ class TimestampedWaveSink(discord.sinks.WaveSink):
             self._stats(user, elapsed)["silence_s"] += (target - pos) / BYTES_PER_S
 
     def write(self, data, user):
-        elapsed = time.monotonic() - self.t0
+        now = time.monotonic()
+        elapsed = now - self.t0
+        self._note_silence(now)
+        self.last_heard = now
+
         st = self._stats(user, elapsed)
         # Paketet bär de senaste 20 ms, så ljudet började en ram före nu.
         self._pad_to(user, elapsed - FRAME_S, LAG_TOLERANCE_S)
+        per_min = st["packets_per_min"]
+        minute = int(elapsed // 60)
+        per_min.extend([0] * (minute + 1 - len(per_min)))
+        per_min[minute] += 1
         st["packets"] += 1
         super().write(data, user)
 
@@ -202,10 +232,111 @@ class TimestampedWaveSink(discord.sinks.WaveSink):
         # annars misstolkas som att personen gick. Körs efter att router-tråden
         # stoppats och innan WaveSink skriver WAV-headern.
         self.stopped_at = time.monotonic()
+        self._note_silence(self.stopped_at)
         elapsed = self.stopped_at - self.t0
         for user in list(self.audio_data):
             self._pad_to(user, elapsed, 0.0)
         super().cleanup()
+
+
+def _fmt_ts(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
+
+
+def _humans_in(vc) -> int:
+    channel = vc.channel
+    return sum(1 for m in channel.members if not m.bot) if channel else 0
+
+
+def _send_udp_keepalive(vc) -> None:
+    """Skickar en extra UDP-keepalive vid sidan av py-cords egen tråd."""
+    conn = vc._connection
+    try:
+        conn.socket.sendto(
+            int(time.monotonic() * 1000).to_bytes(8, "big"),
+            (conn.endpoint_ip, conn.voice_port),
+        )
+    except Exception:
+        _log.warning("Kunde inte skicka extra UDP-keepalive", exc_info=True)
+
+
+def find_gaps(silences, presence, min_humans: int) -> list[dict]:
+    """Väljer ut de tysta perioder som är luckor i inspelningen.
+
+    En period utan ljud är bara en lucka om folk satt i kanalen: sitter en
+    person kvar tyst när mötet är slut är det ingen lucka. Majoriteten av
+    närvaroproverna avgör, så att någon som hoppar ut och in inte döljer en
+    timslång lucka.
+    """
+    gaps = []
+    for start, end in silences:
+        samples = [n for t, n in presence if start <= t <= end]
+        present = sum(1 for n in samples if n >= min_humans)
+        if samples and present * 2 >= len(samples):
+            gaps.append({"start_s": round(start, 1), "end_s": round(end, 1)})
+    return gaps
+
+
+async def watch_silence(session: dict, sink: TimestampedWaveSink, vc) -> None:
+    """Varnar i textkanalen när inget ljud kommer fram under ett möte.
+
+    Först skickas en extra UDP-keepalive, eftersom en utebliven keepalive är
+    den enda kända orsaken till att mottagningen dör. Kommer inget ljud inom
+    SILENCE_NUDGE_WAIT_S varnar vi, en gång per tyst period, och säger till när
+    ljudet är tillbaka. Antalet människor i kanalen sparas i session, så att
+    on_recording_done kan skilja en lucka från ett avslutat möte.
+    """
+    below_min_at = sink.t0  # senast det satt för få i kanalen
+    nudged_at = None
+    warned_from = None  # last_heard när varningen gick ut
+
+    while vc.is_recording():
+        await asyncio.sleep(WATCH_INTERVAL_S)
+        try:
+            now = time.monotonic()
+            humans = _humans_in(vc)
+            session["presence"].append((round(now - sink.t0, 1), humans))
+            if humans < SILENCE_WARN_MIN_HUMANS:
+                below_min_at = now
+
+            if warned_from is not None:
+                if sink.last_heard > warned_from:
+                    await session["text_channel"].send(
+                        f"Ljud mottaget igen, efter "
+                        f"{_fmt_ts(sink.last_heard - warned_from)} utan ljud."
+                    )
+                    warned_from = None
+                continue
+
+            if nudged_at is not None and sink.last_heard > nudged_at:
+                _log.info("Ljudet kom tillbaka efter extra keepalive")
+                nudged_at = None
+
+            silent_s = now - max(sink.last_heard, below_min_at)
+            if silent_s < SILENCE_WARN_S:
+                continue
+
+            if nudged_at is None:
+                _log.warning(
+                    "Inget ljud på %.0f s med %d i kanalen, skickar extra keepalive",
+                    silent_s,
+                    humans,
+                )
+                _send_udp_keepalive(vc)
+                nudged_at = now
+            elif now - nudged_at >= SILENCE_NUDGE_WAIT_S:
+                _log.warning("Inget ljud efter extra keepalive, varnar i kanalen")
+                warned_from = sink.last_heard
+                nudged_at = None
+                await session["text_channel"].send(
+                    f"⚠️ Inget ljud mottaget på {_fmt_ts(silent_s)} fast "
+                    f"{humans} personer sitter i kanalen. Mottagningen kan ha "
+                    f"fallit bort – kör `/stop` och sedan `/record` om ni pratar."
+                )
+        except Exception:
+            _log.exception("Fel i tystnadsvakten")
 
 
 active = {}  # guild_id -> sessionsinfo
@@ -300,6 +431,8 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
     session = active.pop(guild_id, None)
     if session is None:
         return
+    if session.get("watch_task"):
+        session["watch_task"].cancel()
 
     session_dir: Path = session["dir"]
     session_dir.mkdir(parents=True, exist_ok=True)
@@ -336,6 +469,9 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
                 "silence_s": round(stats.get("silence_s", 0.0), 2),
                 "packets": stats.get("packets", 0),
                 "first_heard_s": stats.get("first_s"),
+                # Visar när mottagningen dog: ett spår som går från hundratals
+                # paket per minut till noll för alla samtidigt.
+                "packets_per_min": stats.get("packets_per_min", []),
             }
         )
 
@@ -343,12 +479,20 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
     # till nu - on_recording_done körs en stund efter att inspelningen stoppats.
     stopped_at = getattr(sink, "stopped_at", None) or time.monotonic()
     wall_clock_s = round(stopped_at - session["t0"], 2)
+    gaps = find_gaps(
+        getattr(sink, "silences", []),
+        session.get("presence", []),
+        SILENCE_WARN_MIN_HUMANS,
+    )
     (session_dir / "session.json").write_text(
         json.dumps(
             {
                 "guild_id": str(guild_id),
                 "started_at": session["started_at"],
                 "wall_clock_s": wall_clock_s,
+                # Perioder utan ljud från någon medan folk satt i kanalen.
+                # pipeline.py lägger en varning om dem överst i summary.md.
+                "gaps": gaps,
                 "tracks": tracks,
             },
             ensure_ascii=False,
@@ -378,6 +522,11 @@ async def on_recording_done(sink: discord.sinks.WaveSink, guild_id: int):
         f"Inspelning klar: **{len(tracks)}** spår, {wall_clock_s / 60:.1f} min.\n"
         f"Mottaget tal: {received_s / 60:.1f} min ({andel:.0f} % av väggklockan)."
     )
+    for gap in gaps:
+        msg += (
+            f"\n⚠️ Inget ljud mottaget {_fmt_ts(gap['start_s'])}–"
+            f"{_fmt_ts(gap['end_s'])} ({(gap['end_s'] - gap['start_s']) / 60:.0f} min)."
+        )
     if _decode_errors:
         msg += (
             f"\n{_decode_errors} trasiga paket hoppades över "
@@ -453,10 +602,12 @@ async def record(ctx: discord.ApplicationContext):
     with _decode_errors_lock:
         _decode_errors = 0
 
+    session = active[ctx.guild.id]
+    # Samma nolla som väggklockan i session.json.
+    sink = TimestampedWaveSink(t0=session["t0"])
     try:
         vc.start_recording(
-            # Samma nolla som väggklockan i session.json.
-            TimestampedWaveSink(t0=active[ctx.guild.id]["t0"]),
+            sink,
             on_recording_done,
             ctx.guild.id,
             # sync_start används inte: den är deprekerad sedan 2.7 och en
@@ -474,6 +625,9 @@ async def record(ctx: discord.ApplicationContext):
         return await ctx.followup.send(
             f"Kunde inte starta inspelningen: `{type(e).__name__}: {e}`"
         )
+
+    session["presence"] = []
+    session["watch_task"] = asyncio.create_task(watch_silence(session, sink, vc))
 
     await ctx.followup.send(
         f"Spelar in **{voice.channel.name}**. Alla i kanalen spelas in – stoppa med `/stop`."
