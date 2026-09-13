@@ -144,17 +144,20 @@ def normalize(text: str) -> str:
 def is_junk(seg_text: str, duration: float, no_speech_prob: float, avg_logprob: float):
     """Returnerar en anledning om segmentet ska bort, annars None.
 
-    Fyra oberoende signaler, för de fångar olika fel:
-      no_speech_prob – Whisper tror själv att det inte var tal
-      avg_logprob    – låg konfidens, typiskt hallucination eller mumlande
+    Tre signaler, för de fångar olika fel:
+      avg_logprob    – låg konfidens, typiskt hallucination eller mumlande.
+                       Tror Whisper dessutom att det inte var tal märks
+                       segmentet no_speech istället för low_confidence
       hallucination  – känd påhittad fras, ofta med hög konfidens
       backchannel    – korrekt transkriberat men innehållslöst
+
+    no_speech_prob räcker inte ensam: den gäller hela 30-sekundersfönstret, så
+    säkra repliker som delar fönster med tystnad åkte ut med den. Samma regel
+    som Whisper själv använder för att hoppa över tysta fönster.
     """
     norm = normalize(seg_text)
-    if no_speech_prob > 0.6:
-        return "no_speech"
     if avg_logprob < -1.0:
-        return "low_confidence"
+        return "no_speech" if no_speech_prob > 0.6 else "low_confidence"
     if len(norm.split()) <= HALLUCINATION_MAX_WORDS and any(
         phrase in norm for phrase in HALLUCINATIONS
     ):
