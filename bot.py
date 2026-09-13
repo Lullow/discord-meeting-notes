@@ -36,6 +36,11 @@ _log_handler.setLevel(logging.INFO)
 _log_handler.setFormatter(
     logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 )
+# py-cord loggar varje RTCP Sender Report på INFO, ungefär en rad i sekunden,
+# och de dränker allt annat: 1097 av 1112 rader i ett 20-minuterstest.
+_log_handler.addFilter(
+    lambda record: "unexpected rtcp packet type=200" not in record.getMessage()
+)
 logging.basicConfig(level=logging.WARNING, handlers=[_log_handler])
 for _name in ("discord.voice", "sound-bot"):
     logging.getLogger(_name).setLevel(logging.INFO)
@@ -303,6 +308,9 @@ async def watch_silence(session: dict, sink: TimestampedWaveSink, vc) -> None:
 
             if warned_from is not None:
                 if sink.last_heard > warned_from:
+                    _log.info(
+                        "Ljud mottaget igen efter %.0f s", sink.last_heard - warned_from
+                    )
                     await session["text_channel"].send(
                         f"Ljud mottaget igen, efter "
                         f"{_fmt_ts(sink.last_heard - warned_from)} utan ljud."
