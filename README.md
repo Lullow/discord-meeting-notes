@@ -1,23 +1,24 @@
 # discord-meeting-notes
 
-Spelar in en Discord-röstkanal med ett spår per talare, transkriberar lokalt med
-faster-whisper och sammanfattar med Claude.
+Records a Discord voice channel with one track per speaker, transcribes locally with
+faster-whisper and summarises with Claude.
 
-## Arkitektur
+## Architecture
 
 ```
 Discord voice  ──►  bot.py           ──►  recordings/<session>/
-(Opus/RTP)          py-cord sink          <user_id>_<namn>.wav   (48 kHz, stereo)
-                    ett spår per user     session.json
+(Opus/RTP)          py-cord sink          <user_id>_<name>.wav   (48 kHz, stereo)
+                    one track per user    session.json
 
 recordings/<session>/  ──►  pipeline.py  ──►  transcript.md
                             faster-whisper     transcript.json
                             + Claude           summary.md
 ```
 
-Bot och pipeline är medvetet frikopplade. Inspelningen måste vara realtidsstabil;
-transkriberingen får ta den tid den tar. Du kan också köra `pipeline.py` på
-inspelningar från andra källor (t.ex. Craig) så länge du har en fil per talare.
+The bot and the pipeline are deliberately decoupled. Recording has to be stable in
+real time; transcription may take as long as it takes. You can also run `pipeline.py`
+on recordings from other sources (Craig, for example) as long as you have one file
+per speaker.
 
 ## Setup (Windows / PowerShell)
 
@@ -25,68 +26,73 @@ inspelningar från andra källor (t.ex. Craig) så länge du har en fil per tala
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env   # fyll i dina nycklar
+Copy-Item .env.example .env   # fill in your keys
 ```
 
-För GPU-transkribering behövs CUDA-biblioteken:
+GPU transcription needs the CUDA libraries:
 
 ```powershell
 pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
-Saknar du GPU: kör med `--device cpu --model medium`. Räkna med ungefär
-realtidshastighet på en modern CPU, alltså ~60 min för ett 60-minuterssamtal.
+No GPU? Run with `--device cpu --model medium`. Expect roughly real-time speed on a
+modern CPU, so about 60 minutes for a 60-minute conversation.
 
-## Discord-appen
+## The Discord app
 
 1. https://discord.com/developers/applications → New Application → Bot
-2. Kopiera token till `.env`
-3. Slå på **Server Members Intent** under Bot → Privileged Gateway Intents
+2. Copy the token into `.env`
+3. Enable **Server Members Intent** under Bot → Privileged Gateway Intents
 4. OAuth2 → URL Generator: scopes `bot` + `applications.commands`,
    permissions: Connect, Speak, Change Nickname, Send Messages
-5. Bjud in boten med den genererade länken
+5. Invite the bot with the generated link
 
-## Körning
+## Running
 
 ```powershell
 python bot.py
 ```
 
-I Discord: `/record` → mötet → `/stop`. Boten sparar spåren, kör transkribering
-och sammanfattning automatiskt, och postar resultatet i textkanalen med
-`summary.md` och `transcript.md` bifogade.
+In Discord: `/record` → the meeting → `/stop`. The bot saves the tracks, runs
+transcription and summarisation automatically, and posts the result in the text
+channel with `summary.md` and `transcript.md` attached.
 
-`/summary` kör om pipelinen på senaste sessionen, eller på en angiven mapp:
+`/summary` re-runs the pipeline on the latest session, or on a given directory:
 `/summary session:2026-08-31_19-04-12`.
 
-Pipelinen går också att köra fristående, t.ex. på inspelningar från Craig:
+The pipeline can also be run standalone, for example on recordings from Craig:
 
 ```powershell
 python pipeline.py recordings\2026-08-31_19-04-12
 python pipeline.py recordings\2026-08-31_19-04-12 --device cpu --model medium
 ```
 
-### Tystnadsvakt
+### Silence watchdog
 
-Kommer inget ljud från någon på 3 minuter medan minst 2 personer sitter i
-röstkanalen skickar boten en extra UDP-keepalive. Hjälper inte det inom 30 s
-varnar den i textkanalen och säger till när ljudet är tillbaka. Luckorna sparas
-i `session.json` och visas överst i `summary.md`. Trösklarna ställs i `.env`
-med `SILENCE_WARN_MIN` och `SILENCE_WARN_MIN_HUMANS`.
+If no audio arrives from anyone for 3 minutes while at least 2 people are in the
+voice channel, the bot sends an extra UDP keepalive. If that does not help within
+30 s it warns in the text channel, and says so when the audio is back. The gaps are
+recorded in `session.json` and shown at the top of `summary.md`. The thresholds are
+set in `.env` with `SILENCE_WARN_MIN` and `SILENCE_WARN_MIN_HUMANS`.
 
-Loggar med tidsstämplar hamnar i `bot.log`.
+Timestamped logs end up in `bot.log`.
 
-## Kända begränsningar
+## Known limitations
 
-- **py-cord från en PR-branch.** Röstmottagning fungerar bara på
-  `fix/voice-rec-2` (se `requirements.txt`), och `bot.py` lappar två fel i den.
-  Ett trasigt Opus-paket dödar annars hela inspelningen. `UDPKeepAlive` skickar
-  keepalive var 83:e minut istället för var 5:e sekund, så Discord slutar skicka
-  ljud efter 5–9 minuter. Loggen säger när keepalive-lappen inte längre behövs.
-- **Spårsynk.** Varje spår fylls ut med tystnad mot väggklockan, så alla spår
-  delar tidslinje och är lika långa. Tiden mäts när paketet behandlas och inte
-  när ordet sades, så ordningen mellan talare kan vara fel med upp till längden
-  på ett trådstopp, typiskt under en sekund.
-- **6 h+ sessioner** bör chunkas innan sammanfattning. En 2-timmarsutskrift är
-  runt 30k tokens och går fint i ett anrop.
-- Whisper hallucinerar på tyst ljud. `vad_filter=True` är därför inte valfritt.
+- **py-cord from a PR branch.** Voice receiving only works on
+  `fix/voice-rec-2` (see `requirements.txt`), and `bot.py` patches two bugs in it.
+  Otherwise a single malformed Opus packet kills the entire recording. `UDPKeepAlive`
+  sends a keepalive every 83 minutes instead of every 5 seconds, so Discord stops
+  sending audio after 5–9 minutes. The log says when the keepalive patch is no
+  longer needed.
+- **Track sync.** Each track is padded with silence against the wall clock, so all
+  tracks share a timeline and are the same length. Time is measured when the packet
+  is processed rather than when the word was said, so the ordering between speakers
+  can be off by up to the length of a thread stall, typically under a second.
+- **6 h+ sessions** should be chunked before summarisation. A 2-hour transcript is
+  around 30k tokens and fits fine in one call.
+- Whisper hallucinates on silent audio. `vad_filter=True` is therefore not optional.
+
+---
+
+*Note: the code comments in this repository are written in Swedish.*
